@@ -114,10 +114,19 @@ void initTreeViewBindings(PyObject* module) {
         return Param::create(
             name.range(),
             name,
-            type,
+            Maybe<Expr>::create(type.range(), type),
             Maybe<Expr>::create(name.range()),
             kwarg_only);
-      }));
+      }))
+      .def(py::init(
+          [](const Maybe<Expr>& type, const Ident& name, bool kwarg_only) {
+            return Param::create(
+                name.range(),
+                name,
+                type,
+                Maybe<Expr>::create(name.range()),
+                kwarg_only);
+          }));
   py::class_<Attribute, TreeView>(m, "Attribute")
       .def(py::init([](const Ident& name, const Expr& value) {
         return Attribute::create(name.range(), name, value);
@@ -287,14 +296,17 @@ void initTreeViewBindings(PyObject* module) {
             wrap_list(base.range(), std::move(subscript_exprs)));
       }));
   py::class_<SliceExpr, Expr>(m, "SliceExpr")
-      .def(py::init([](const SourceRange& range, Expr* lower, Expr* upper) {
+      .def(py::init([](const SourceRange& range, Expr* lower, Expr* upper, Expr* step) {
         return SliceExpr::create(
-            range, wrap_maybe(range, lower), wrap_maybe(range, upper));
+            range, wrap_maybe(range, lower), wrap_maybe(range, upper), wrap_maybe(range, step));
       }));
   py::class_<Starred, Expr>(m, "Starred")
       .def(py::init([](const SourceRange& range, Expr expr) {
         return Starred::create(range, expr);
       }));
+  py::class_<Maybe<Expr>, TreeView>(m, "EmptyTypeAnnotation")
+      .def(py::init(
+          [](const SourceRange& range) { return Maybe<Expr>::create(range); }));
 }
 
 } // namespace script

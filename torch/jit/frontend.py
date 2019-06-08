@@ -234,7 +234,7 @@ def build_param(ctx, py_arg, self_name, kwarg_only):
     elif self_name is not None and name == 'self':
         annotation_expr = Var(Ident(r, self_name))
     else:
-        annotation_expr = Var(Ident(r, 'Tensor'))
+        annotation_expr = EmptyTypeAnnotation(r)
     return Param(annotation_expr, Ident(r, name), kwarg_only)
 
 
@@ -526,10 +526,8 @@ class ExprBuilder(Builder):
         def build_SliceExpr(ctx, base, slice_expr):
             lower = build_expr(ctx, slice_expr.lower) if slice_expr.lower is not None else None
             upper = build_expr(ctx, slice_expr.upper) if slice_expr.upper is not None else None
-            if slice_expr.step is not None:
-                step = build_expr(ctx, slice_expr.step)
-                raise NotSupportedError(step.range(), "slices with ranges are not supported yet")
-            return SliceExpr(base.range(), lower, upper)
+            step = build_expr(ctx, slice_expr.step) if slice_expr.step is not None else None
+            return SliceExpr(base.range(), lower, upper, step)
 
         def build_Index(ctx, base, index_expr):
             if isinstance(index_expr.value, ast.Tuple) or \
@@ -598,6 +596,27 @@ class ExprBuilder(Builder):
         value = str(expr.s)
         r = ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + 1)
         return StringLiteral(r, value)
+
+    @staticmethod
+    def build_JoinedStr(ctx, expr):
+        s = ''
+        args = []
+        for value in expr.values:
+            r = ctx.make_range(value.lineno, value.col_offset, value.col_offset + 1)
+            if isinstance(value, ast.FormattedValue):
+                if value.conversion != -1:
+                    raise NotSupportedError(r, 'Don\'t support conversion in JoinedStr')
+                if value.format_spec is not None:
+                    raise NotSupportedError(r, 'Don\'t support formatting in JoinedStr')
+                s += '{}'
+                args.append(build_expr(ctx, value.value))
+            elif isinstance(value, ast.Str):
+                s += value.s
+            else:
+                raise NotSupportedError(r, 'Unsupported value in JoinedStr')
+
+        r = ctx.make_range(expr.lineno, expr.col_offset, expr.col_offset + 1)
+        return Apply(Select(StringLiteral(r, s), Ident(r, 'format')), args, [])
 
     @staticmethod
     def build_ListComp(ctx, stmt):

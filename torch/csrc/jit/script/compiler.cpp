@@ -210,14 +210,14 @@ struct Environment {
   Function& method;
   ResolverPtr resolver;
   std::vector<std::string> captured_inputs;
-  std::unordered_map<std::string, std::string> error_messages;
+  std::unordered_map<std::string, std::function<std::string()>> error_messages;
   Block* b;
 
   std::shared_ptr<Environment> next;
 
   // set type error in the lowest environment. if the variable is used after an
   // error has been set, then we will use the more informative error message
-  void setVariableTypeError(const std::string& name, const std::string& msg) {
+  void setVariableTypeError(const std::string& name, std::function<std::string()> msg) {
     auto runner = this;
     while (runner->next) {
       runner = runner->next.get();
@@ -233,7 +233,7 @@ struct Environment {
     }
     auto msg = runner->error_messages.find(name);
     if (msg != runner->error_messages.end()) {
-      return msg->second;
+      return msg->second();
     } else {
       return c10::nullopt;
     }
@@ -673,7 +673,7 @@ struct to_ir {
       auto param = *it;
       auto def = param.defaultValue();
       if (def.present()) {
-        default_types.emplace_back(param.type());
+        default_types.emplace_back(param.type().get());
         default_exprs.emplace_back(def.get());
       }
     }
@@ -686,15 +686,22 @@ struct to_ir {
 
       TypePtr type;
       c10::optional<int32_t> N;
-
-      // BroadcastList list can only appear at the argument level
-      if (auto maybe_broad_list =
-              typeParser_.parseBroadcastList(decl_arg.type())) {
-        type = maybe_broad_list->first;
-        N = maybe_broad_list->second;
-      } else {
-        type = typeParser_.parseTypeFromExpr(decl_arg.type());
+      bool is_inferred_type = false;
+      if (!decl_arg.type().present()) {
+        // If this param doesn't have a type, default to "tensor"
+        is_inferred_type = true;
+        type = TensorType::get();
         N = c10::nullopt;
+      } else {
+        // BroadcastList list can only appear at the argument level
+        if (auto maybe_broad_list =
+                typeParser_.parseBroadcastList(decl_arg.type().get())) {
+          type = maybe_broad_list->first;
+          N = maybe_broad_list->second;
+        } else {
+          type = typeParser_.parseTypeFromExpr(decl_arg.type().get());
+          N = c10::nullopt;
+        }
       }
       c10::optional<IValue> default_value = c10::nullopt;
       if (decl_arg.defaultValue().present()) {
@@ -705,7 +712,9 @@ struct to_ir {
           type,
           N,
           default_value,
-          decl_arg.kwarg_only());
+          decl_arg.kwarg_only(),
+          /*alias_info=*/c10::nullopt,
+          is_inferred_type);
       retval.push_back(arg);
     }
     return retval;
@@ -1200,11 +1209,23 @@ struct to_ir {
     for (auto& v : save_true->definedVariables()) {
       if (save_false->findInAnyFrame(v)) {
         mutated_variables.insert(v);
+      } else {
+        ErrorReport error(stmt);
+        environment_stack->setVariableTypeError(v, [=]() -> std::string {
+          error << v << " is not defined in the false branch";
+          return error.what();
+        });
       }
     }
     for (auto& v : save_false->definedVariables()) {
       if (save_true->findInAnyFrame(v)) {
         mutated_variables.insert(v);
+      } else {
+        ErrorReport error(stmt);
+        environment_stack->setVariableTypeError(v, [=]() -> std::string {
+          error << v << " is not defined in the true branch";
+          return error.what();
+        });
       }
     }
 
@@ -1235,10 +1256,9 @@ struct to_ir {
             save_false->findInParentFrame(x)) {
           throw error;
         } else {
-          // error gets saved in the lowest environment because all
-          // variables are scoped to the function. doesn't matter if this
-          // accessed through save_true or save_false
-          save_true->setVariableTypeError(x, error.what());
+          environment_stack->setVariableTypeError(x, [=]() -> std::string {
+            return error.what();
+          });
           continue;
         }
       }
@@ -1427,7 +1447,7 @@ struct to_ir {
           << "range expected at most 3 arguments, got " << args.size();
     }
     const auto& ident_name = target.name();
-    AT_CHECK(
+    TORCH_CHECK(
         end_val != nullptr && start_val != nullptr && step_val != nullptr,
         "Expected non-null pointers for range() arguments");
     auto addOp = [end_val, range](
@@ -2705,16 +2725,25 @@ struct to_ir {
       args.emplace_back(loc, "end", emitExpr(Expr(slice.end().get())));
     }
     if (input->type()->cast<TupleType>()) {
+      auto has_step = slice.step().present();
+      if (has_step)
+      {
+        // TODO: add support for slicing tuples with a step
+        throw ErrorReport(loc) << "Unsupported operation: slicing tuples with a step isn't supported";
+      }
+
       if (has_end) {
         return emitTupleSlice(loc, args[0], args[1], /*end*/ args[2]);
       } else {
         return emitTupleSlice(loc, args[0], args[1], c10::nullopt);
       }
     }
-    NamedValue step =
-        NamedValue(loc, "step", graph->insertConstant(1, nullptr, loc));
+
+    auto step = emitExpr(Expr(slice.stepOr(1)));
+    NamedValue step_nv =
+        NamedValue(loc, "step", step);
     return emitBuiltinCall(
-        loc, *graph, aten::slice, c10::nullopt, args, {step}, true);
+        loc, *graph, aten::slice, c10::nullopt, args, {step_nv}, true);
   }
 
   Value* emitUnsqueeze(const SourceRange& loc, Value* input, int64_t dim) {
@@ -3124,7 +3153,7 @@ void CompilationUnit::define(
     const std::string& source,
     const ResolverPtr& resolver,
     const Self& self) {
-  Parser p(source);
+  Parser p(std::make_shared<Source>(source, "<string>", 1));
   std::vector<Def> definitions;
   std::vector<ResolverPtr> resolvers;
   while (p.lexer().cur().kind != TK_EOF) {
