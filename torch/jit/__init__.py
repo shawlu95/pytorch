@@ -8,7 +8,6 @@ import torch.jit.annotations
 import torch._jit_internal as _jit_internal
 from torch._six import PY2, PY37, with_metaclass, get_function_from_type, \
     string_classes, builtins
-from torch._jit_internal import ignore, export  # noqa: F401
 from ..nn.modules.utils import _single, _pair, _triple, _quadruple, \
     _list_with_default
 import torch.testing
@@ -27,6 +26,11 @@ import copy
 import collections
 import inspect
 import pickle
+
+# These are imported so users can access them from the `torch.jit` module
+from torch._jit_internal import Final  # noqa: F401
+from torch._jit_internal import ignore, export  # noqa: F401
+
 if sys.version_info[0] > 2:
     import pathlib
 
@@ -287,7 +291,11 @@ class LegacyTracedModule(Module):
         # NOTE: use full state, because we need it for BatchNorm export
         # This differs from the compiler path, which doesn't support it at the moment.
         module_state = list(_unique_state_dict(self, keep_vars=True).values())
-        trace, all_trace_inputs = torch._C._tracer_enter(*(in_vars + module_state))
+        try:
+            trace, all_trace_inputs = torch._C._tracer_enter(*(in_vars + module_state))
+        except Exception as e:
+            torch._C._tracer_abandon()
+            raise e
         ret_inputs = tuple(x.clone() for x in all_trace_inputs)
         torch._C._tracer_set_force_outplace(self._force_outplace)
         torch._C._tracer_set_get_unique_name_fn(_create_interpreter_name_lookup_fn())
@@ -1147,6 +1155,9 @@ class OrderedDictWrapper(object):
     def values(self):
         return [v for k, v in self.items()]
 
+    def __len__(self):
+        return len(self.values())
+
     def __delitem__(self, k):
         raise RuntimeError("cannot delete methods or parameters of a script module")
 
@@ -1619,6 +1630,11 @@ if _enabled:
                 else:
                     self.register_buffer(name, original._buffers[name])
 
+            # Constants annotated via `Final[T]` rather than being added to `__constants__`
+            for name, ann in getattr(original, '__annotations__', {}).items():
+                if torch._jit_internal.is_final(ann):
+                    constants_set.add(name)
+
             # Copy constants
             self.__dict__["_constants_set"] = constants_set
             for name in self.__dict__["_constants_set"]:
@@ -1800,8 +1816,8 @@ class TracedModule(ScriptModule):
             raise ValueError("Modules that have hooks assigned can't be compiled")
 
         for name, submodule in orig._modules.items():
-            if isinstance(submodule, ScriptModule) and not isinstance(submodule, TracedModule):
-                self._modules[name] = submodule.copy()
+            if isinstance(submodule, ScriptModule):
+                self._modules[name] = submodule
             else:
                 self._modules[name] = TracedModule(submodule, id_set, optimize=optimize)
 
@@ -2013,6 +2029,21 @@ def _get_script_class(name):
 # torch.jit.Error
 Error = torch._C.JITException
 
+def _get_named_tuple_properties(obj):
+    assert issubclass(obj, tuple) and hasattr(obj, '_fields')
+    fields = list(obj._fields)
+    annotations = []
+    has_annotations = hasattr(obj, '__annotations__')
+    for field in fields:
+        if has_annotations and field in obj.__annotations__:
+            annotations.append(torch.jit.annotations.ann_to_type(obj.__annotations__[field]))
+        else:
+            annotations.append(torch._C.TensorType.get())
+    return type(obj).__name__, fields, annotations
+
+def _create_named_tuple(t, names, unqual_name):
+    TupleType = collections.namedtuple(unqual_name, names)
+    return TupleType(*t)
 
 class _disable_tracing(object):
     def __enter__(self):

@@ -488,6 +488,13 @@ std::shared_ptr<SugaredValue> toSugaredValue(
   }
 
   if (py::isinstance<py::function>(obj)) {
+    if (typeString(obj) == "builtin_function_or_method") {
+      throw ErrorReport(loc)
+          << "You are calling a python builtin_function_or_method "
+          << "which is currently not supported in Torchscript."
+          << "Please open a feature request to add it.";
+    }
+
     auto compiled_fn =
         py::module::import("torch.jit").attr("_try_compile_weak_script")(obj);
     if (auto callee = as_function(compiled_fn)) {
@@ -508,15 +515,6 @@ std::shared_ptr<SugaredValue> toSugaredValue(
     auto& pyCu = CompilationUnit::_get_python_cu();
     if (auto classType = pyCu.get_class(c10::QualifiedName(qualifiedName))) {
       return std::make_shared<ClassValue>(classType);
-    }
-    // Use a heuristic here to identify NamedTuple instances:
-    // 1) must be a subclass of tuple
-    // 2) Has an attribute "_fields"
-    auto tuple_type = reinterpret_cast<PyObject*>(&PyTuple_Type);
-    if (PyObject_IsSubclass(obj.ptr(), tuple_type) &&
-        py::hasattr(obj, "_fields")) {
-      throw ErrorReport(loc)
-          << "NamedTuple is currently not supported in TorchScript";
     }
   }
 
