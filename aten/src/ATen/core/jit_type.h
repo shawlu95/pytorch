@@ -1390,11 +1390,7 @@ struct CAFFE2_API ClassType : public Type {
   // Create a class type with name `name` and its methods stored in `cu`.
   static ClassTypePtr create(
       QualifiedName qualifiedName,
-      std::shared_ptr<CompilationUnit> cu);
-
-  // Create a type representing a Module,
-  // These do not have methods, and are not globally registered
-  static ClassTypePtr createModuleType(std::shared_ptr<CompilationUnit> module);
+      std::shared_ptr<CompilationUnit> cu, bool is_module = false);
 
   DEFINE_IS_SUBCLASS(ClassType);
   bool operator==(const Type& rhs) const override {
@@ -1453,9 +1449,9 @@ struct CAFFE2_API ClassType : public Type {
   }
 
   std::shared_ptr<Function> getMethod(const std::string& name) const;
-  CompilationUnit& compilation_unit();
-  const CompilationUnit& compilation_unit() const;
   std::vector<Function*> methods() const;
+  std::shared_ptr<CompilationUnit> compilation_unit();
+  std::shared_ptr<const CompilationUnit> compilation_unit() const;
 
 
   size_t numAttributes() const {
@@ -1466,7 +1462,7 @@ struct CAFFE2_API ClassType : public Type {
   // Attributes are stored in a specific slot at runtime for effiency.
   // When emitting instructions we specify the slot so that attribute access is
   // a constant lookup
-  size_t getAttributeSlot(const std::string& name) const {
+  c10::optional<size_t> findAttributeSlot(const std::string& name) const {
     AT_ASSERT(attributeNames_.size() == attributeTypes_.size());
     size_t slot = 0;
     for (const auto& attr : attributeNames_) {
@@ -1475,7 +1471,13 @@ struct CAFFE2_API ClassType : public Type {
       }
       slot++;
     }
-    throw std::runtime_error("Couldn't find attribute: " + name);
+    return c10::nullopt;
+  }
+  size_t getAttributeSlot(const std::string& name) const {
+    if (auto r = findAttributeSlot(name)) {
+      return *r;
+    }
+    TORCH_CHECK(false, python_str(), " does not have a field with the name '", name, "'");
   }
 
   bool hasAttribute(const std::string& name) const {
@@ -1486,10 +1488,7 @@ struct CAFFE2_API ClassType : public Type {
         attributeNames_.cend();
   }
 
-  void addAttribute(const std::string& name, TypePtr type) {
-    attributeNames_.push_back(name);
-    attributeTypes_.push_back(type);
-  }
+  size_t addAttribute(const std::string& name, TypePtr type, bool is_parameter=false);
 
   at::ArrayRef<std::string> attributeNames() const {
     return attributeNames_;
@@ -1506,10 +1505,18 @@ struct CAFFE2_API ClassType : public Type {
   // that would invalidate the refinement.
   // These variants are not registered in the global class table.
   ClassTypePtr refine(at::ArrayRef<TypePtr> refined_slots) const;
+
+  bool is_module() const {
+    return bool(parameterSlots_);
+  }
+  bool is_parameter(size_t slot) const {
+    TORCH_INTERNAL_ASSERT(is_module(), "asking for parameterSlots of non-Module");
+    return parameterSlots_->at(slot);
+  }
   static const TypeKind Kind = TypeKind::ClassType;
 
  private:
-  ClassType(QualifiedName name, std::shared_ptr<CompilationUnit> cu);
+  ClassType(QualifiedName name, std::shared_ptr<CompilationUnit> cu, bool is_module);
 
   // Fully qualified name of type (note that this has to be globally unique).
   // Looks like: "foo.bar.Baz".
@@ -1526,5 +1533,9 @@ struct CAFFE2_API ClassType : public Type {
   // Holds method attributes
   std::shared_ptr<CompilationUnit> compilation_unit_;
 
+
+  // if present, this class inherits from torch.nn.Module
+  // and these are the indices of the attributes which are parameters
+  std::shared_ptr<std::vector<bool>> parameterSlots_;
 };
 } // namespace c10
